@@ -1,0 +1,62 @@
+name: Windows 2022 + Tailscale + Secure RDP
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  secure-rdp:
+    runs-on: windows-2022
+    timeout-minutes: 350
+    steps:
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@v4
+        with:
+          authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
+      - name: Configure Secure RDP
+        shell: pwsh
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $Username = "rdpuser"
+          $SecurePassword = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
+          $ExistingUser = Get-LocalUser -Name $Username -ErrorAction SilentlyContinue
+          if ($ExistingUser) {
+            Set-LocalUser -Name $Username -Password $SecurePassword
+          }
+          else {
+            New-LocalUser -Name $Username -Password $SecurePassword -Description "Dedicated RDP account"
+          }
+          $InGroup = Get-LocalGroupMember -Group "Remote Desktop Users" -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -like "*\$Username" }
+          if (-not $InGroup) {
+            Add-LocalGroupMember -Group "Remote Desktop Users" -Member $Username
+          }
+          Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server" -Name "fDenyTSConnections" -Value 0
+          $RdpPath = "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp"
+          Set-ItemProperty -Path $RdpPath -Name "UserAuthentication" -Value 1
+          Set-ItemProperty -Path $RdpPath -Name "SecurityLayer" -Value 2
+          Disable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue
+          Remove-NetFirewallRule -DisplayName "RDP-Tailscale-Only" -ErrorAction SilentlyContinue
+          New-NetFirewallRule -DisplayName "RDP-Tailscale-Only" `
+            -Direction Inbound `
+            -Protocol TCP `
+            -LocalPort 3389 `
+            -RemoteAddress "100.64.0.0/10" `
+            -Action Allow `
+            -Profile Any
+          $TailscaleIP = (tailscale ip -4 | Select-Object -First 1).Trim()
+          if (-not $TailscaleIP) {
+            throw "Tailscale IP not found"
+          }
+          Write-Host "================================"
+          Write-Host "RDP CONFIGURATION COMPLETED"
+          Write-Host "RDP ADDRESS: $TailscaleIP"
+          Write-Host "RDP PORT: 3389"
+          Write-Host "RDP USER: $Username"
+          Write-Host "================================"
+      - name: Keep Windows Session Alive
+        shell: pwsh
+        run: |
+          Write-Host "Windows RDP session is running."
+          Start-Sleep -Seconds 20400
