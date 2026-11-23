@@ -1,60 +1,125 @@
+
 name: Windows 2022 + Tailscale + Secure RDP
+
 on:
   workflow_dispatch:
+
 permissions:
   contents: read
+
 jobs:
   secure-rdp:
     runs-on: windows-2022
     timeout-minutes: 350
+
     steps:
       - name: Connect to Tailscale
         uses: tailscale/github-action@v4
         with:
           authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
+
       - name: Configure Secure RDP
         shell: pwsh
         env:
           RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+          ADMIN_PASSWORD: ${{ secrets.ADMIN_PASSWORD }}
+
         run: |
           $ErrorActionPreference = "Stop"
+
+          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
+            throw "RDP_PASSWORD secret is missing"
+          }
+
+          if ([string]::IsNullOrWhiteSpace($env:ADMIN_PASSWORD)) {
+            throw "ADMIN_PASSWORD secret is missing"
+          }
+
+          # 1. Configure rdpuser
           $Username = "rdpuser"
           $SecurePassword = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
+
           $ExistingUser = Get-LocalUser -Name $Username -ErrorAction SilentlyContinue
+
           if ($ExistingUser) {
             Set-LocalUser -Name $Username -Password $SecurePassword
           }
           else {
-            New-LocalUser -Name $Username -Password $SecurePassword -Description "Dedicated RDP account"
+            New-LocalUser -Name $Username `
+              -Password $SecurePassword `
+              -Description "Dedicated RDP account"
           }
-          $InGroup = Get-LocalGroupMember -Group "Remote Desktop Users" -ErrorAction SilentlyContinue |
+
+          Enable-LocalUser -Name $Username
+
+          # 2. Add rdpuser to Remote Desktop Users
+          $InRdpGroup = Get-LocalGroupMember -Group "Remote Desktop Users" |
             Where-Object { $_.Name -like "*\$Username" }
-          if (-not $InGroup) {
+
+          if (-not $InRdpGroup) {
             Add-LocalGroupMember -Group "Remote Desktop Users" -Member $Username
           }
-          Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server" -Name "fDenyTSConnections" -Value 0
+
+          # 3. Give rdpuser Administrator privileges
+          $InAdminGroup = Get-LocalGroupMember -Group "Administrators" |
+            Where-Object { $_.Name -like "*\$Username" }
+
+          if (-not $InAdminGroup) {
+            Add-LocalGroupMember -Group "Administrators" -Member $Username
+          }
+
+          # 4. Set password for built-in Administrator account
+          $BuiltInAdmin = Get-LocalUser |
+            Where-Object { $_.SID.Value -match '-500$' }
+
+          if (-not $BuiltInAdmin) {
+            throw "Built-in Administrator account not found"
+          }
+
+          $AdminSecurePassword = ConvertTo-SecureString $env:ADMIN_PASSWORD -AsPlainText -Force
+
+          Set-LocalUser -Name $BuiltInAdmin.Name -Password $AdminSecurePassword
+          Enable-LocalUser -Name $BuiltInAdmin.Name
+
+          # 5. Enable secure RDP
+          Set-ItemProperty `
+            -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server" `
+            -Name "fDenyTSConnections" -Value 0
+
           $RdpPath = "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp"
+
           Set-ItemProperty -Path $RdpPath -Name "UserAuthentication" -Value 1
           Set-ItemProperty -Path $RdpPath -Name "SecurityLayer" -Value 2
+
+          # 6. Restrict RDP firewall access to Tailscale IP range
           Disable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue
+
           Remove-NetFirewallRule -DisplayName "RDP-Tailscale-Only" -ErrorAction SilentlyContinue
-          New-NetFirewallRule -DisplayName "RDP-Tailscale-Only" `
+
+          New-NetFirewallRule `
+            -DisplayName "RDP-Tailscale-Only" `
             -Direction Inbound `
             -Protocol TCP `
             -LocalPort 3389 `
             -RemoteAddress "100.64.0.0/10" `
             -Action Allow `
             -Profile Any
+
+          # 7. Get Tailscale IP
           $TailscaleIP = (tailscale ip -4 | Select-Object -First 1).Trim()
+
           if (-not $TailscaleIP) {
             throw "Tailscale IP not found"
           }
+
           Write-Host "================================"
           Write-Host "RDP CONFIGURATION COMPLETED"
           Write-Host "RDP ADDRESS: $TailscaleIP"
           Write-Host "RDP PORT: 3389"
           Write-Host "RDP USER: $Username"
+          Write-Host "ADMIN ACCOUNT: Enabled"
           Write-Host "================================"
+
       - name: Keep Windows Session Alive
         shell: pwsh
         run: |
